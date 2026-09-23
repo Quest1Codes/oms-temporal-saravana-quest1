@@ -1,9 +1,11 @@
+using System.Reflection;
 using OMS.Worker.Activities;
 using OMS.Worker.Models;
 using OMS.Worker.Services;
 using OMS.Worker.Workflows;
 using Temporalio.Testing;
 using Temporalio.Worker;
+using Temporalio.Workflows;
 using Xunit;
 
 namespace OMS.Tests;
@@ -39,6 +41,18 @@ public class OrderWorkflowTests
         {
             new OrderItem("ITEM-1", 1)
         }));
+
+    [Fact]
+    public void ActivityOptions_AreBoundByScheduleToCloseNotMaxAttempts()
+    {
+        var method = typeof(OrderProcessingWorkflow)
+            .GetMethod("ActivityOptions", BindingFlags.Static | BindingFlags.NonPublic);
+
+        Assert.NotNull(method);
+
+        var activityOptions = Assert.IsType<ActivityOptions>(method!.Invoke(null, null));
+        Assert.Null(activityOptions.RetryPolicy);
+    }
 
     [Fact]
     public async Task ValidOrder_WaitsForPayment()

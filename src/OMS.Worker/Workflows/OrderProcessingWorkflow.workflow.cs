@@ -215,53 +215,25 @@ public sealed class OrderProcessingWorkflow
     private static ActivityOptions ActivityOptions() => new()
     {
         StartToCloseTimeout = TimeSpan.FromSeconds(15),
-        ScheduleToCloseTimeout = TimeSpan.FromMinutes(2),
-        RetryPolicy = new()
-        {
-            InitialInterval = TimeSpan.FromSeconds(1),
-            BackoffCoefficient = 2,
-            MaximumInterval = TimeSpan.FromSeconds(10),
-            MaximumAttempts = 3
-        }
+        ScheduleToCloseTimeout = TimeSpan.FromMinutes(2)
     };
 
     private static ActivityOptions PaymentActivityOptions() => new()
     {
         StartToCloseTimeout = TimeSpan.FromSeconds(10),
-        ScheduleToCloseTimeout = TimeSpan.FromMinutes(1),
-        RetryPolicy = new()
-        {
-            InitialInterval = TimeSpan.FromSeconds(1),
-            BackoffCoefficient = 2,
-            MaximumInterval = TimeSpan.FromSeconds(5),
-            MaximumAttempts = 3
-        }
+        ScheduleToCloseTimeout = TimeSpan.FromMinutes(1)
     };
 
     private static ActivityOptions FulfillmentActivityOptions() => new()
     {
         StartToCloseTimeout = TimeSpan.FromSeconds(15),
-        ScheduleToCloseTimeout = TimeSpan.FromMinutes(3),
-        RetryPolicy = new()
-        {
-            InitialInterval = TimeSpan.FromSeconds(2),
-            BackoffCoefficient = 2,
-            MaximumInterval = TimeSpan.FromSeconds(15),
-            MaximumAttempts = 5
-        }
+        ScheduleToCloseTimeout = TimeSpan.FromMinutes(3)
     };
 
     private static ActivityOptions CompensationActivityOptions() => new()
     {
         StartToCloseTimeout = TimeSpan.FromSeconds(15),
-        ScheduleToCloseTimeout = TimeSpan.FromMinutes(2),
-        RetryPolicy = new()
-        {
-            InitialInterval = TimeSpan.FromSeconds(1),
-            BackoffCoefficient = 2,
-            MaximumInterval = TimeSpan.FromSeconds(10),
-            MaximumAttempts = 3
-        }
+        ScheduleToCloseTimeout = TimeSpan.FromMinutes(2)
     };
 
     private static bool IsTerminal(OrderStatus orderStatus) =>

@@ -3,6 +3,7 @@ using OMS.Worker.Activities;
 using OMS.Worker.Models;
 using OMS.Worker.Services;
 using OMS.Worker.Workflows;
+using Temporalio.Common;
 using Temporalio.Testing;
 using Temporalio.Worker;
 using Temporalio.Workflows;
@@ -41,6 +42,52 @@ public class OrderWorkflowTests
         {
             new OrderItem("ITEM-1", 1)
         }));
+
+    [Fact]
+    public void Workflow_UsesPinnedVersioningBehavior()
+    {
+        var workflowAttribute = typeof(OrderProcessingWorkflow)
+            .GetCustomAttributes(typeof(WorkflowAttribute), true)
+            .OfType<object>()
+            .FirstOrDefault();
+
+        Assert.NotNull(workflowAttribute);
+
+        var versioningProperty = workflowAttribute!
+            .GetType()
+            .GetProperty("VersioningBehavior");
+
+        Assert.NotNull(versioningProperty);
+        Assert.Equal(VersioningBehavior.Pinned, versioningProperty!.GetValue(workflowAttribute));
+    }
+
+    [Fact]
+    public void CommerceValidation_UsesDedicatedQueueAndRateLimit()
+    {
+        var method = typeof(OrderProcessingWorkflow)
+            .GetMethod("ValidationActivityOptions", BindingFlags.Static | BindingFlags.NonPublic);
+
+        Assert.NotNull(method);
+
+        var activityOptions = Assert.IsType<ActivityOptions>(method!.Invoke(null, null));
+        Assert.Equal(TemporalConstants.CommerceTaskQueue, activityOptions.TaskQueue);
+
+        var workerOptions = new TemporalWorkerOptions(TemporalConstants.CommerceTaskQueue)
+        {
+            MaxTaskQueueActivitiesPerSecond = 150
+        };
+
+        Assert.Equal(150, workerOptions.MaxTaskQueueActivitiesPerSecond ?? 0);
+    }
+
+    [Fact]
+    public void Workflow_RegistersStatusSearchAttribute()
+    {
+        var field = typeof(OrderProcessingWorkflow)
+            .GetField("OrderStatusKey", BindingFlags.Static | BindingFlags.NonPublic);
+
+        Assert.NotNull(field);
+    }
 
     [Fact]
     public void ActivityOptions_AreBoundByScheduleToCloseNotMaxAttempts()

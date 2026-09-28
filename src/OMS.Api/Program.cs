@@ -42,11 +42,11 @@ app.UseSwaggerUI();
 app.MapControllers();
 app.MapPrometheusScrapingEndpoint();
 
-app.MapGet("/health", () =>
+app.MapGet("/health", (IConfiguration config) =>
     Results.Ok(new
     {
         status = "ok",
-        temporal = "localhost:7233"
+        temporal = config["Temporal:TargetHost"] ?? "localhost:7233"
     }));
 
 app.Run();

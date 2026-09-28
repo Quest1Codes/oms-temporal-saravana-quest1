@@ -16,17 +16,47 @@ public sealed class SupportController : ControllerBase
     [HttpPost("cancel")]
     public async Task<IActionResult> Cancel(string orderId, [FromBody] CancelRequest request)
     {
-        var handle = temporal.GetWorkflowHandle<OrderProcessingWorkflow>(orderId);
-        await handle.SignalAsync(wf => wf.CancelAsync(request.Reason));
-        return Accepted(new { orderId, signal = "CancelOrder" });
+        try
+        {
+            var handle = temporal.GetWorkflowHandle<OrderProcessingWorkflow>(orderId);
+            await handle.ExecuteUpdateAsync(
+                (OrderProcessingWorkflow wf) => wf.CancelOrderUpdateAsync(request.Reason),
+                new WorkflowUpdateOptions());
+            return Accepted(new { orderId, signal = "CancelOrder" });
+        }
+        catch (Exception ex) when (ex.Message.Contains("not found", StringComparison.OrdinalIgnoreCase)
+            || ex.Message.Contains("Workflow not found", StringComparison.OrdinalIgnoreCase))
+        {
+            return NotFound(new { error = "Order workflow does not exist." });
+        }
+        catch (Exception ex) when (ex.Message.Contains("cannot be cancelled", StringComparison.OrdinalIgnoreCase)
+            || ex.Message.Contains("not allowed", StringComparison.OrdinalIgnoreCase))
+        {
+            return Conflict(new { error = ex.Message });
+        }
     }
 
     [HttpPost("support-correction")]
     public async Task<IActionResult> Correct(string orderId, SupportCorrection correction)
     {
-        var handle = temporal.GetWorkflowHandle<OrderProcessingWorkflow>(orderId);
-        await handle.SignalAsync(wf => wf.CorrectOrderAsync(correction));
-        return Accepted(new { orderId, signal = "SupportCorrection" });
+        try
+        {
+            var handle = temporal.GetWorkflowHandle<OrderProcessingWorkflow>(orderId);
+            await handle.ExecuteUpdateAsync(
+                (OrderProcessingWorkflow wf) => wf.CorrectOrderUpdateAsync(correction),
+                new WorkflowUpdateOptions());
+            return Accepted(new { orderId, signal = "SupportCorrection" });
+        }
+        catch (Exception ex) when (ex.Message.Contains("not found", StringComparison.OrdinalIgnoreCase)
+            || ex.Message.Contains("Workflow not found", StringComparison.OrdinalIgnoreCase))
+        {
+            return NotFound(new { error = "Order workflow does not exist." });
+        }
+        catch (Exception ex) when (ex.Message.Contains("only allowed", StringComparison.OrdinalIgnoreCase)
+            || ex.Message.Contains("not allowed", StringComparison.OrdinalIgnoreCase))
+        {
+            return Conflict(new { error = ex.Message });
+        }
     }
 }
 

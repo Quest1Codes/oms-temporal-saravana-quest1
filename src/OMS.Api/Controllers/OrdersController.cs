@@ -24,14 +24,24 @@ public sealed class OrdersController : ControllerBase
     {
         var workflowId = request.Order.OrderId;
 
-        var handle = await temporal.StartWorkflowAsync(
-            (OrderProcessingWorkflow wf) => wf.RunAsync(request),
-            new(id: workflowId, taskQueue: TemporalConstants.TaskQueue));
-
-        return Ok(new
+        try
         {
-            workflowId = handle.Id
-        });
+            var handle = await temporal.StartWorkflowAsync(
+                (OrderProcessingWorkflow wf) => wf.RunAsync(request),
+                new StartWorkflowOptions
+                {
+                    Id = workflowId,
+                    TaskQueue = TemporalConstants.TaskQueue,
+                    IdConflictPolicy = WorkflowIdConflictPolicy.UseExisting,
+                    IdReusePolicy = WorkflowIdReusePolicy.RejectDuplicate
+                });
+
+            return Ok(new { workflowId = handle.Id });
+        }
+        catch (Exception ex) when (ex.Message.Contains("already started", StringComparison.OrdinalIgnoreCase))
+        {
+            return Conflict(new { error = "Workflow already exists for this order." });
+        }
     }
 
     [HttpGet("{orderId}")]

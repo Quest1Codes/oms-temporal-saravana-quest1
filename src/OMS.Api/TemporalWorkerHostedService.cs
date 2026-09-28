@@ -37,22 +37,31 @@ public sealed class TemporalWorkerHostedService : BackgroundService
             new MockFulfillmentService(),
             metrics);
 
-        var workerOptions = new TemporalWorkerOptions(TemporalConstants.TaskQueue)
+        var defaultWorkerOptions = new TemporalWorkerOptions(TemporalConstants.TaskQueue)
         {
             DeploymentOptions = new WorkerDeploymentOptions(
                 new WorkerDeploymentVersion(
                     configuration["Temporal:WorkerDeploymentName"] ?? "oms-order-worker",
                     configuration["Temporal:WorkerBuildId"] ?? "oms-local"),
-                useWorkerVersioning: true),
+                useWorkerVersioning: true)
+            {
+                DefaultVersioningBehavior = VersioningBehavior.Pinned
+            },
             MaxConcurrentActivities = configuration.GetValue<int?>("Temporal:MaxConcurrentActivities") ?? 20,
             MaxConcurrentWorkflowTasks = configuration.GetValue<int?>("Temporal:MaxConcurrentWorkflowTasks") ?? 100
         };
 
-        using var worker = new TemporalWorker(
+        var commerceWorkerOptions = new TemporalWorkerOptions(TemporalConstants.CommerceTaskQueue)
+        {
+            MaxConcurrentActivities = configuration.GetValue<int?>("Temporal:MaxConcurrentActivities") ?? 20,
+            MaxConcurrentWorkflowTasks = configuration.GetValue<int?>("Temporal:MaxConcurrentWorkflowTasks") ?? 100,
+            MaxTaskQueueActivitiesPerSecond = 150
+        };
+
+        using var defaultWorker = new TemporalWorker(
             client,
-            workerOptions
+            defaultWorkerOptions
                 .AddWorkflow<OrderProcessingWorkflow>()
-                .AddActivity(activities.ValidateOrderAsync)
                 .AddActivity(activities.EnrichOrderAsync)
                 .AddActivity(activities.ValidatePaymentAsync)
                 .AddActivity(activities.SaveStatusAsync)
@@ -60,6 +69,13 @@ public sealed class TemporalWorkerHostedService : BackgroundService
                 .AddActivity(activities.FulfillAsync)
                 .AddActivity(activities.CompensateFulfillmentAsync));
 
-        await worker.ExecuteAsync(stoppingToken);
+        using var commerceWorker = new TemporalWorker(
+            client,
+            commerceWorkerOptions
+                .AddActivity(activities.ValidateOrderAsync));
+
+        await Task.WhenAll(
+            defaultWorker.ExecuteAsync(stoppingToken),
+            commerceWorker.ExecuteAsync(stoppingToken));
     }
 }

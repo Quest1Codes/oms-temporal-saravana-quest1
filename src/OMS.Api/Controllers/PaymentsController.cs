@@ -21,8 +21,23 @@ public sealed class PaymentsController : ControllerBase
             return BadRequest("Order ID in the route and payload must match.");
         }
 
-        var handle = temporal.GetWorkflowHandle<OrderProcessingWorkflow>(orderId);
-        await handle.SignalAsync(wf => wf.CapturePaymentAsync(request));
-        return Accepted(new { orderId, signal = "PaymentCaptured" });
+        try
+        {
+            var handle = temporal.GetWorkflowHandle<OrderProcessingWorkflow>(orderId);
+            await handle.ExecuteUpdateAsync(
+                (OrderProcessingWorkflow wf) => wf.CapturePaymentUpdateAsync(request),
+                new WorkflowUpdateOptions());
+            return Accepted(new { orderId, signal = "PaymentCaptured" });
+        }
+        catch (Exception ex) when (ex.Message.Contains("not found", StringComparison.OrdinalIgnoreCase)
+            || ex.Message.Contains("Workflow not found", StringComparison.OrdinalIgnoreCase))
+        {
+            return NotFound(new { error = "Order workflow does not exist." });
+        }
+        catch (Exception ex) when (ex.Message.Contains("allowed", StringComparison.OrdinalIgnoreCase)
+            || ex.Message.Contains("already been captured", StringComparison.OrdinalIgnoreCase))
+        {
+            return Conflict(new { error = ex.Message });
+        }
     }
 }

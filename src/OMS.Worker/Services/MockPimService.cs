@@ -10,7 +10,7 @@ public sealed class MockPimService
             .Select(item => item with
             {
                 SkuId = $"SKU-{item.ItemId}",
-                BrandCode = $"BRAND-{Math.Abs(item.ItemId.GetHashCode()) % 1000:000}"
+                BrandCode = $"BRAND-{StableHash(item.ItemId) % 1000:000}"
             })
             .ToArray();
 
@@ -18,5 +18,16 @@ public sealed class MockPimService
             submission.CustomerId,
             submission.Order.OrderId,
             items));
+    }
+
+    private static int StableHash(string value)
+    {
+        var hash = 0;
+        foreach (var c in value)
+        {
+            hash = ((hash * 131) + c) & int.MaxValue;
+        }
+
+        return hash;
     }
 }

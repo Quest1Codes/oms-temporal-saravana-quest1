@@ -1,13 +1,13 @@
 # OMS Temporal POC
 
-A small .NET 8 proof of concept for the Partner Application Assessment: Order Processing Management System (OMS).
+A .NET 9 proof of concept for the Partner Application Assessment: Order Processing Management System (OMS).
 
 ## Scope
 
 - Temporal is the durable orchestration layer.
 - No Kafka is used in this POC.
 - Temporal CLI dev server uses its default **in-memory persistence** for the Temporal service.
-- Application order/dashboard data uses an in-memory repository.
+- Application order/dashboard data uses SQLite-backed storage via the repository layer.
 - Commerce, PIM, Payment, and Fulfillment are mocked as in-process services behind Activities.
 - ASP.NET Core hosts the API and the Temporal Worker in the same process for a simple demo.
 - Temporal Web UI is provided by `temporal server start-dev` at `http://localhost:8233`.
@@ -33,7 +33,7 @@ A small .NET 8 proof of concept for the Partner Application Assessment: Order Pr
 
 ## Prerequisites
 
-- .NET 8 SDK
+- .NET 9 SDK
 - Temporal CLI
 
 The Temporal .NET SDK currently has 1.18.0 available on NuGet. This project pins that version for repeatable builds.

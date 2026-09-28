@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace OMS.Worker.Models;
 
 public enum OrderStatus
@@ -16,41 +18,48 @@ public enum OrderStatus
 }
 
 public record OrderSubmission(
-    string CustomerId,
-    OrderPayload Order,
-    RiskData? RiskData = null);
+    [property: JsonPropertyName("customer_id")] string CustomerId,
+    [property: JsonPropertyName("order")] OrderPayload Order,
+    [property: JsonPropertyName("risk_data")] RiskData? RiskData = null);
 
 public record OrderPayload(
-    string OrderId,
-    IReadOnlyList<OrderItem> Items);
+    [property: JsonPropertyName("order_id")] string OrderId,
+    [property: JsonPropertyName("items")] IReadOnlyList<OrderItem> Items);
 
 public record OrderItem(
-    string ItemId,
-    int Quantity,
-    string? SkuId = null,
-    string? BrandCode = null);
+    [property: JsonPropertyName("item_id")] string ItemId,
+    [property: JsonPropertyName("quantity")] int Quantity,
+    [property: JsonPropertyName("sku_id")] string? SkuId = null,
+    [property: JsonPropertyName("brand_code")] string? BrandCode = null);
 
-public record RiskData(string? RiskInput, string? RiskDecision = null);
+public record RiskData(
+    [property: JsonPropertyName("risk_input")] string? RiskInput,
+    [property: JsonPropertyName("risk_decision")] string? RiskDecision = null);
 
 public record PaymentCapture(
-    string CustomerId,
-    string Rrn,
-    long AmountCents,
-    string OrderId);
+    [property: JsonPropertyName("customer_id")] string CustomerId,
+    [property: JsonPropertyName("rrn")] string Rrn,
+    [property: JsonPropertyName("amount_cents")] long AmountCents,
+    [property: JsonPropertyName("order_id")] string OrderId);
 
-public record SupportCorrection(IReadOnlyList<OrderItem> Items);
+public record SupportCorrection(
+    [property: JsonPropertyName("items")] IReadOnlyList<OrderItem> Items);
 
-public record ValidationResult(bool IsValid, string? Reason = null);
+public record ValidationResult(
+    [property: JsonPropertyName("is_valid")] bool IsValid,
+    [property: JsonPropertyName("reason")] string? Reason = null);
 
 public record EnrichedOrder(
-    string CustomerId,
-    string OrderId,
-    IReadOnlyList<OrderItem> Items);
+    [property: JsonPropertyName("customer_id")] string CustomerId,
+    [property: JsonPropertyName("order_id")] string OrderId,
+    [property: JsonPropertyName("items")] IReadOnlyList<OrderItem> Items);
 
-public record FulfillmentResult(string OrderId, bool Accepted);
+public record FulfillmentResult(
+    [property: JsonPropertyName("order_id")] string OrderId,
+    [property: JsonPropertyName("accepted")] bool Accepted);
 
 public record OrderStatusView(
-    string OrderId,
-    OrderStatus Status,
-    string? Message = null,
-    string? Rrn = null);
+    [property: JsonPropertyName("order_id")] string OrderId,
+    [property: JsonPropertyName("status")] OrderStatus Status,
+    [property: JsonPropertyName("message")] string? Message = null,
+    [property: JsonPropertyName("rrn")] string? Rrn = null);

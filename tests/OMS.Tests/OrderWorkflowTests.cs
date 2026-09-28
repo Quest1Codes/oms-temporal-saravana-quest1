@@ -153,7 +153,7 @@ public class OrderWorkflowTests
     }
 
     [Fact]
-    public async Task InvalidPayment_CompletesAsPaymentRejected()
+    public async Task InvalidPayment_RetriesUntilValidCapture()
     {
         await using var env = await WorkflowEnvironment.StartTimeSkippingAsync();
         using var worker = CreateWorker(env);
@@ -161,14 +161,42 @@ public class OrderWorkflowTests
         await worker.ExecuteAsync(async () =>
         {
             var handle = await env.Client.StartWorkflowAsync(
-                (OrderProcessingWorkflow wf) => wf.RunAsync(ValidOrder("ORD-PAYMENT")),
-                new(id: "ORD-PAYMENT", taskQueue: "test-orders"));
+                (OrderProcessingWorkflow wf) => wf.RunAsync(ValidOrder("ORD-RETRY")),
+                new(id: "ORD-RETRY", taskQueue: "test-orders"));
 
             await handle.SignalAsync(wf => wf.CapturePaymentAsync(
-                new PaymentCapture("CUST-1", "INVALID", 100, "ORD-PAYMENT")));
+                new PaymentCapture("CUST-1", "INVALID", 100, "ORD-RETRY")));
+
+            await handle.SignalAsync(wf => wf.CapturePaymentAsync(
+                new PaymentCapture("CUST-1", "RRN-VALID", 150, "ORD-RETRY")));
+
             var result = await handle.GetResultAsync();
 
-            Assert.Equal(OrderStatus.PaymentRejected, result.Status);
+            Assert.Equal(OrderStatus.Fulfilled, result.Status);
+        });
+    }
+
+    [Fact]
+    public async Task MismatchedCustomerPayment_IsIgnored()
+    {
+        await using var env = await WorkflowEnvironment.StartTimeSkippingAsync();
+        using var worker = CreateWorker(env);
+
+        await worker.ExecuteAsync(async () =>
+        {
+            var handle = await env.Client.StartWorkflowAsync(
+                (OrderProcessingWorkflow wf) => wf.RunAsync(ValidOrder("ORD-UNMATCHED")),
+                new(id: "ORD-UNMATCHED", taskQueue: "test-orders"));
+
+            await handle.SignalAsync(wf => wf.CapturePaymentAsync(
+                new PaymentCapture("CUST-999", "RRN-VALID", 150, "ORD-UNMATCHED")));
+
+            await handle.SignalAsync(wf => wf.CapturePaymentAsync(
+                new PaymentCapture("CUST-1", "RRN-VALID", 150, "ORD-UNMATCHED")));
+
+            var result = await handle.GetResultAsync();
+
+            Assert.Equal(OrderStatus.Fulfilled, result.Status);
         });
     }
 }

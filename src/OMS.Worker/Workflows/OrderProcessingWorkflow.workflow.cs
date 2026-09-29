@@ -69,7 +69,7 @@ public sealed class OrderProcessingWorkflow
 
         state.EnrichedOrder = await Workflow.ExecuteActivityAsync(
             (OrderActivities a) => a.EnrichOrderAsync(submission),
-            ActivityOptions());
+            EnrichmentActivityOptions());
 
         await SaveStatusAsync(submission.Order.OrderId, OrderStatus.Enriched);
         await SaveStatusAsync(submission.Order.OrderId, OrderStatus.WaitingForPayment);
@@ -167,7 +167,7 @@ public sealed class OrderProcessingWorkflow
             {
                 await Workflow.ExecuteActivityAsync(
                     (OrderActivities a) => a.SaveFulfilledAsync(state.EnrichedOrder!, capturedPayment),
-                    ActivityOptions());
+                    FulfilledDashboardActivityOptions());
             }
             catch
             {
@@ -324,9 +324,11 @@ public sealed class OrderProcessingWorkflow
         await Workflow.ExecuteActivityAsync(
             (OrderActivities a) => a.SaveStatusAsync(
                 new OrderStatusView(orderId, newStatus, newMessage, rrn)),
-            ActivityOptions());
+            StatusActivityOptions());
     }
 
+    // Commerce validation: short per-attempt budget, 2-min total window matches the 150 RPS
+    // Commerce rate-limit queue; a longer window would accumulate backpressure behind the queue.
     private static ActivityOptions ValidationActivityOptions() => new()
     {
         TaskQueue = TemporalConstants.CommerceTaskQueue,
@@ -334,22 +336,46 @@ public sealed class OrderProcessingWorkflow
         ScheduleToCloseTimeout = TimeSpan.FromMinutes(2)
     };
 
-    private static ActivityOptions ActivityOptions() => new()
+    // PIM enrichment: service deploys may take minutes; allow hours so a brief outage
+    // does not permanently fail a 30-day order. MaximumInterval caps exponential back-off.
+    private static ActivityOptions EnrichmentActivityOptions() => new()
     {
-        StartToCloseTimeout = TimeSpan.FromSeconds(15),
-        ScheduleToCloseTimeout = TimeSpan.FromMinutes(2)
+        StartToCloseTimeout = TimeSpan.FromSeconds(30),
+        ScheduleToCloseTimeout = TimeSpan.FromHours(4),
+        RetryPolicy = new RetryPolicy { MaximumInterval = TimeSpan.FromMinutes(5) }
     };
 
+    // Dashboard status writes are projection updates; they must eventually succeed
+    // but should never fail the order. No ScheduleToCloseTimeout — retry indefinitely
+    // up to the workflow lifetime, with back-off capped at 5 min.
+    private static ActivityOptions StatusActivityOptions() => new()
+    {
+        StartToCloseTimeout = TimeSpan.FromSeconds(15),
+        RetryPolicy = new RetryPolicy { MaximumInterval = TimeSpan.FromMinutes(5) }
+    };
+
+    // Payment validation: a 1-min total budget lets a brief processor blip retry
+    // while still responding to the payment webhook within a reasonable SLA.
     private static ActivityOptions PaymentActivityOptions() => new()
     {
         StartToCloseTimeout = TimeSpan.FromSeconds(10),
         ScheduleToCloseTimeout = TimeSpan.FromMinutes(1)
     };
 
+    // Fulfillment submission: idempotent by order ID, but downstream may queue.
+    // Hours window tolerable because fulfillment acceptance is the final step.
     private static ActivityOptions FulfillmentActivityOptions() => new()
     {
+        StartToCloseTimeout = TimeSpan.FromSeconds(30),
+        ScheduleToCloseTimeout = TimeSpan.FromHours(4),
+        RetryPolicy = new RetryPolicy { MaximumInterval = TimeSpan.FromMinutes(5) }
+    };
+
+    // Dashboard fulfilled write: same eventually-consistent projection policy as status writes.
+    private static ActivityOptions FulfilledDashboardActivityOptions() => new()
+    {
         StartToCloseTimeout = TimeSpan.FromSeconds(15),
-        ScheduleToCloseTimeout = TimeSpan.FromMinutes(3)
+        RetryPolicy = new RetryPolicy { MaximumInterval = TimeSpan.FromMinutes(5) }
     };
 
     private static ActivityOptions CompensationActivityOptions() => new()

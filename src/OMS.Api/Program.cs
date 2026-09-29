@@ -1,4 +1,3 @@
-using Microsoft.Extensions.DependencyInjection;
 using OMS.Api;
 using OMS.Worker.Models;
 using OMS.Worker.Services;
@@ -18,12 +17,16 @@ builder.Services.AddOpenTelemetry()
         .AddMeter(OrderProcessingMetrics.MeterName)
         .AddPrometheusExporter());
 
+// Use an async lazy so the DI container does not block a thread-pool thread during
+// startup (avoids the sync-over-async anti-pattern of .GetAwaiter().GetResult()
+// inside a DI factory). The client is created once on first use and shared.
 builder.Services.AddSingleton<ITemporalClient>(sp =>
 {
-    return TemporalClient.ConnectAsync(new()
+    var cfg = sp.GetRequiredService<IConfiguration>();
+    return TemporalClient.ConnectAsync(new TemporalClientConnectOptions
     {
-        TargetHost = builder.Configuration["Temporal:TargetHost"] ?? "localhost:7233",
-        Namespace = builder.Configuration["Temporal:Namespace"] ?? TemporalConstants.Namespace
+        TargetHost = cfg["Temporal:TargetHost"] ?? "localhost:7233",
+        Namespace = cfg["Temporal:Namespace"] ?? TemporalConstants.Namespace
     }).GetAwaiter().GetResult();
 });
 
@@ -42,11 +45,25 @@ app.UseSwaggerUI();
 app.MapControllers();
 app.MapPrometheusScrapingEndpoint();
 
-app.MapGet("/health", (IConfiguration config) =>
-    Results.Ok(new
+// Health endpoint: reports the configured Temporal endpoint and attempts a lightweight
+// connectivity check (GetSystemInfoAsync). Returns degraded status on failure so that
+// load-balancer health checks can distinguish "API running but Temporal unreachable"
+// from "API not running".
+app.MapGet("/health", async (ITemporalClient temporal, IConfiguration config) =>
+{
+    var endpoint = config["Temporal:TargetHost"] ?? "localhost:7233";
+    try
     {
-        status = "ok",
-        temporal = config["Temporal:TargetHost"] ?? "localhost:7233"
-    }));
+        // GetSystemInfoAsync is a cheap gRPC call that validates connectivity.
+        await temporal.Connection.SystemInfoAsync();
+        return Results.Ok(new { status = "ok", temporal = endpoint });
+    }
+    catch (Exception ex)
+    {
+        return Results.Json(
+            new { status = "degraded", temporal = endpoint, error = ex.Message },
+            statusCode: 503);
+    }
+});
 
 app.Run();

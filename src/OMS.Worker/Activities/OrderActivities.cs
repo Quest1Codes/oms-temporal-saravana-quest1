@@ -62,11 +62,15 @@ public sealed class OrderActivities
     {
         return TrackAsync(nameof(SaveFulfilledAsync), () =>
         {
+            // Store enriched order details (customer, items with SKU + brand code) so
+            // the dashboard row is a complete denormalized record, not just status + RRN.
             repository.Save(new OrderStatusView(
-                order.OrderId,
-                OrderStatus.Fulfilled,
-                "Order forwarded to fulfillment.",
-                paymentCapture.Rrn));
+                OrderId: order.OrderId,
+                Status: OrderStatus.Fulfilled,
+                Message: "Order forwarded to fulfillment.",
+                Rrn: paymentCapture.Rrn,
+                CustomerId: order.CustomerId,
+                Items: order.Items));
             return Task.CompletedTask;
         });
     }
@@ -76,13 +80,21 @@ public sealed class OrderActivities
         EnrichedOrder order,
         PaymentCapture paymentCapture)
     {
-        return await TrackAsync(nameof(FulfillAsync), () => fulfillment.SubmitAsync(order, paymentCapture));
-    }
+        // Build the outbound fulfillment message matching the spec contract:
+        // customer_id, order_id, payment_details.rrn, items[].item_id/sku_id/brand_code
+        var message = new FulfillmentMessage(
+            CustomerId: order.CustomerId,
+            OrderId: order.OrderId,
+            PaymentDetails: new FulfillmentPaymentDetails(paymentCapture.Rrn),
+            Items: order.Items
+                .Select(i => new FulfillmentItem(
+                    ItemId: i.ItemId,
+                    Quantity: i.Quantity,
+                    SkuId: i.SkuId ?? string.Empty,
+                    BrandCode: i.BrandCode ?? string.Empty))
+                .ToArray());
 
-    [Activity]
-    public async Task<bool> CompensateFulfillmentAsync(string orderId)
-    {
-        return await TrackAsync(nameof(CompensateFulfillmentAsync), () => fulfillment.CancelAsync(orderId));
+        return await TrackAsync(nameof(FulfillAsync), () => fulfillment.SubmitAsync(message));
     }
 
     private async Task<T> TrackAsync<T>(string activityName, Func<Task<T>> operation)

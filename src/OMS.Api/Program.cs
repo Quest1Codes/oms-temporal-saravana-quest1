@@ -32,7 +32,9 @@ builder.Services.AddSingleton<ITemporalClient>(sp =>
 
 builder.Services.AddHostedService<TemporalWorkerHostedService>();
 
-builder.Services.AddControllers();
+builder.Services.AddControllers()
+    .AddJsonOptions(opts =>
+        opts.JsonSerializerOptions.Converters.Add(new System.Text.Json.Serialization.JsonStringEnumConverter()));
 
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
@@ -54,8 +56,8 @@ app.MapGet("/health", async (ITemporalClient temporal, IConfiguration config) =>
     var endpoint = config["Temporal:TargetHost"] ?? "localhost:7233";
     try
     {
-        // GetSystemInfoAsync is a cheap gRPC call that validates connectivity.
-        await temporal.Connection.SystemInfoAsync();
+        // CheckHealthAsync is a cheap gRPC call that validates connectivity.
+        await temporal.Connection.CheckHealthAsync();
         return Results.Ok(new { status = "ok", temporal = endpoint });
     }
     catch (Exception ex)

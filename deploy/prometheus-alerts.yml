@@ -1,6 +1,8 @@
 groups:
   - name: oms-temporal
     rules:
+
+      # Overall activity failure rate above 5% for 10 minutes.
       - alert: OMSActivityFailureRateHigh
         expr: |
           sum(rate(oms_activity_failures_total[10m]))
@@ -10,14 +12,64 @@ groups:
           severity: warning
         annotations:
           summary: OMS activity failure rate is above 5%
-          description: Order activity failures have exceeded the warning threshold for 10 minutes.
+          description: >
+            Order activity failures have exceeded the warning threshold for 10 minutes.
+            Check Temporal UI for failed workflow executions.
 
-      - alert: OMSFulfillmentCompensationFailing
+      # Commerce validation failures specifically — may indicate a rate-limit breach
+      # or a Commerce API outage.
+      - alert: OMSCommerceValidationFailureRateHigh
         expr: |
-          sum(rate(oms_activity_failures_total{activity="CompensateFulfillmentAsync"}[5m])) > 0
+          sum(rate(oms_activity_failures_total{activity="ValidateOrderAsync"}[5m]))
+            / clamp_min(sum(rate(oms_activity_executions_total{activity="ValidateOrderAsync"}[5m])), 1) > 0.10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: OMS Commerce validation failure rate is above 10%
+          description: >
+            High Commerce API failure rate. Check the oms-commerce-processing task queue
+            for backlog and verify the Commerce API is healthy and within the 150 RPS limit.
+
+      # Fulfillment rejection rate — a non-zero rate means paid orders are not being fulfilled.
+      - alert: OMSFulfillmentRejected
+        expr: |
+          sum(rate(oms_activity_failures_total{activity="FulfillAsync"}[10m])) > 0
         for: 5m
         labels:
           severity: critical
         annotations:
-          summary: OMS fulfillment compensation is failing
-          description: Fulfillment compensation failures can leave external fulfillment state inconsistent.
+          summary: OMS fulfillment is rejecting orders
+          description: >
+            FulfillAsync is failing. Paid orders are reaching FulfillmentFailed status.
+            Check the fulfillment service and look for FulfillmentFailed workflows in
+            the Temporal UI (filter: OrderStatus = 'FulfillmentFailed').
+
+      # Payment validation failures — invalid RRNs park back to WaitingForPayment,
+      # but sustained failures may indicate a payment processor issue.
+      - alert: OMSPaymentValidationFailureRateHigh
+        expr: |
+          sum(rate(oms_activity_failures_total{activity="ValidatePaymentAsync"}[10m]))
+            / clamp_min(sum(rate(oms_activity_executions_total{activity="ValidatePaymentAsync"}[10m])), 1) > 0.10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: OMS payment validation failure rate is above 10%
+          description: >
+            High payment validation failure rate. Orders are parking back to WaitingForPayment.
+            Check the payment processor service for outages or RRN format issues.
+
+      # Dashboard write failures — these are eventually-consistent projections with
+      # unbounded retry, so a sustained failure means the dashboard is lagging.
+      - alert: OMSDashboardWriteFailureRateHigh
+        expr: |
+          sum(rate(oms_activity_failures_total{activity="SaveStatusAsync"}[10m])) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: OMS dashboard write failure rate is elevated
+          description: >
+            SaveStatusAsync is failing persistently. The customer dashboard is lagging
+            behind workflow state. Check the SQLite/database connectivity.

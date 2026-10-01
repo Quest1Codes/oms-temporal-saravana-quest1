@@ -41,20 +41,21 @@ The Temporal .NET SDK is pinned to `1.18.0` for repeatable builds.
 
 ## Run
 
-Terminal 1:
+Terminal 1 — start the Temporal dev server with the `OrderStatus` search attribute pre-registered:
 
 ```powershell
-temporal server start-dev
+.\temporal-start.ps1
 ```
 
-The Temporal dev server defaults to in-memory persistence and starts the Web UI. The server is available on `localhost:7233` and the UI on `http://localhost:8233`.
+This runs `temporal server start-dev --search-attribute "OrderStatus=Keyword"`. The server is available on `localhost:7233` and the UI on `http://localhost:8233`.
 
-Terminal 2:
+Terminal 2 — build, start the API + worker, and promote the worker deployment version:
 
 ```powershell
-dotnet restore
-dotnet run --project src/OMS.Api
+.\run.ps1
 ```
+
+This runs `dotnet restore`, starts the API in the background, waits 10 seconds for the worker to connect, then runs `temporal worker deployment set-current-version` to promote `oms-order-worker/dev`. Without this step, workflow tasks are scheduled but never dispatched (worker versioning requires an explicit current version).
 
 Open the API shown by ASP.NET Core and the Temporal UI at `http://localhost:8233`.
 
@@ -139,7 +140,7 @@ The Temporal dev server's default in-memory persistence intentionally loses Work
   - **Dashboard writes** (status and fulfilled): `StartToClose = 15 s`, `ScheduleToClose = null` (unbounded), `MaximumInterval = 5 min`. Dashboard rows are eventually-consistent projections; a DB blip must never fail the business transaction.
   - **Payment validation**: `StartToClose = 10 s`, `ScheduleToClose = 1 min`. A tight budget is intentional — a 1-minute outage parks the order back at `WaitingForPayment` for a fresh capture rather than burning retries.
 - Workflow state is kept in one private `WorkflowState` object. Signals/Updates buffer intent and are reconciled by the workflow body, so payment can arrive before enrichment completes.
-- Commerce validation runs on the dedicated `oms-commerce` task queue with `MaxTaskQueueActivitiesPerSecond = 150` to honour the documented 150 RPS rate limit. Other activities run on the default `oms-order-processing` queue.
+- Commerce validation runs on the dedicated `oms-commerce-processing` task queue with `MaxTaskQueueActivitiesPerSecond = 150` to honour the documented 150 RPS rate limit. Other activities run on the default `oms-order-processing` queue.
 - Signal handlers use Update validators to reject inputs in the wrong phase (cancel after capture, correction while not in `ValidationFailed`). All three controllers map Update failures to HTTP 409 Conflict so callers receive synchronous feedback.
 - Cancellation is gated at two levels: the `CancelAsync` signal handler returns early if `state.PaymentCapture != null`, and the `CancelOrderUpdateAsync` validator throws. A cancel that arrives after capture is silently dropped by the signal and rejected with a 409 by the Update.
 - Payment validation failure clears `state.PaymentCapture` and loops back to the payment wait with the remaining TTL — `PaymentRejected` is no longer a terminal dead-end.

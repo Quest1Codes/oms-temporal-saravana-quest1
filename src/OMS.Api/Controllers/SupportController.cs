@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Mvc;
 using OMS.Worker.Models;
 using OMS.Worker.Workflows;
 using Temporalio.Client;
+using Temporalio.Exceptions;
 
 namespace OMS.Api.Controllers;
 
@@ -22,17 +23,26 @@ public sealed class SupportController : ControllerBase
             await handle.ExecuteUpdateAsync(
                 (OrderProcessingWorkflow wf) => wf.CancelOrderUpdateAsync(request.Reason),
                 new WorkflowUpdateOptions());
-            return Accepted(new { orderId, signal = "CancelOrder" });
+            return Accepted(new { orderId, message = "Cancellation signal sent" });
         }
-        catch (Exception ex) when (ex.Message.Contains("not found", StringComparison.OrdinalIgnoreCase)
-            || ex.Message.Contains("Workflow not found", StringComparison.OrdinalIgnoreCase))
+        catch (WorkflowUpdateFailedException e)
+            when (e.InnerException is ApplicationFailureException af)
         {
-            return NotFound(new { error = "Order workflow does not exist." });
+            // Validator rejected: payment already captured, terminal state, etc.
+            return Conflict(new { error = af.Message, type = af.ErrorType });
         }
-        catch (Exception ex) when (ex.Message.Contains("cannot be cancelled", StringComparison.OrdinalIgnoreCase)
-            || ex.Message.Contains("not allowed", StringComparison.OrdinalIgnoreCase))
+        catch (RpcException rpc) when (rpc.Code == RpcException.StatusCode.NotFound)
         {
-            return Conflict(new { error = ex.Message });
+            return NotFound(new { error = $"Order '{orderId}' not found." });
+        }
+        catch (RpcException rpc) when (rpc.Message.Contains("workflow execution already completed",
+            StringComparison.OrdinalIgnoreCase))
+        {
+            return Conflict(new { error = "Order is already in a terminal state." });
+        }
+        catch (RpcException rpc)
+        {
+            return StatusCode(503, new { error = "Order service temporarily unavailable.", detail = rpc.Message });
         }
     }
 
@@ -45,17 +55,26 @@ public sealed class SupportController : ControllerBase
             await handle.ExecuteUpdateAsync(
                 (OrderProcessingWorkflow wf) => wf.CorrectOrderUpdateAsync(correction),
                 new WorkflowUpdateOptions());
-            return Accepted(new { orderId, signal = "SupportCorrection" });
+            return Accepted(new { orderId, message = "Support correction signal sent" });
         }
-        catch (Exception ex) when (ex.Message.Contains("not found", StringComparison.OrdinalIgnoreCase)
-            || ex.Message.Contains("Workflow not found", StringComparison.OrdinalIgnoreCase))
+        catch (WorkflowUpdateFailedException e)
+            when (e.InnerException is ApplicationFailureException af)
         {
-            return NotFound(new { error = "Order workflow does not exist." });
+            // Validator rejected: order is not in ValidationFailed state.
+            return Conflict(new { error = af.Message, type = af.ErrorType });
         }
-        catch (Exception ex) when (ex.Message.Contains("only allowed", StringComparison.OrdinalIgnoreCase)
-            || ex.Message.Contains("not allowed", StringComparison.OrdinalIgnoreCase))
+        catch (RpcException rpc) when (rpc.Code == RpcException.StatusCode.NotFound)
         {
-            return Conflict(new { error = ex.Message });
+            return NotFound(new { error = $"Order '{orderId}' not found." });
+        }
+        catch (RpcException rpc) when (rpc.Message.Contains("workflow execution already completed",
+            StringComparison.OrdinalIgnoreCase))
+        {
+            return Conflict(new { error = "Order is already in a terminal state." });
+        }
+        catch (RpcException rpc)
+        {
+            return StatusCode(503, new { error = "Order service temporarily unavailable.", detail = rpc.Message });
         }
     }
 }

@@ -66,8 +66,7 @@ public sealed class TemporalWorkerHostedService : BackgroundService
                 .AddActivity(activities.ValidatePaymentAsync)
                 .AddActivity(activities.SaveStatusAsync)
                 .AddActivity(activities.SaveFulfilledAsync)
-                .AddActivity(activities.FulfillAsync)
-                .AddActivity(activities.CompensateFulfillmentAsync));
+                .AddActivity(activities.FulfillAsync));
 
         using var commerceWorker = new TemporalWorker(
             client,

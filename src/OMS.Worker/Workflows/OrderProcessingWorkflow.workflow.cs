@@ -1,6 +1,7 @@
 using OMS.Worker.Activities;
 using OMS.Worker.Models;
 using Temporalio.Common;
+using Temporalio.Exceptions;
 using Temporalio.Workflows;
 
 namespace OMS.Worker.Workflows;
@@ -10,49 +11,79 @@ public sealed class OrderProcessingWorkflow
 {
     private const int OrderTtlDays = 30;
     private static readonly TimeSpan OrderTtl = TimeSpan.FromDays(OrderTtlDays);
-    private static readonly SearchAttributeKey<string> OrderStatusKey = SearchAttributeKey.CreateKeyword("OrderStatus");
+    private static readonly SearchAttributeKey<string> OrderStatusKey =
+        SearchAttributeKey.CreateKeyword("OrderStatus");
+
     private readonly WorkflowState state = new();
 
+    // Pending dashboard-projection tasks started with fire-and-forget semantics.
+    // Awaited via WhenAllAsync before each terminal return.
+    private readonly List<Task> pendingProjections = new();
+
     [WorkflowRun]
-    public async Task<OrderStatusView> RunAsync(OrderSubmission submission)
+    public async Task<OrderStatusView> RunAsync(OrderSubmission? submission = null)
     {
+        // -----------------------------------------------------------------------
+        // Payment-before-order: workflow may be started by the payment controller
+        // (via signal-with-start) before the Commerce webhook arrives.  In that
+        // case submission is null and we wait for it to arrive as a signal.
+        // -----------------------------------------------------------------------
+        if (submission == null)
+        {
+            var arrived = await Workflow.WaitConditionAsync(
+                () => state.PendingSubmission != null,
+                OrderTtl);
+
+            if (!arrived || state.PendingSubmission == null)
+                return await ExpireAsync(Workflow.Info.WorkflowId,
+                    "Order submission was never received.");
+
+            submission = state.PendingSubmission;
+        }
+
         var orderDeadline = Workflow.UtcNow + OrderTtl;
         state.CustomerId = submission.CustomerId;
 
-        await SaveStatusAsync(submission.Order.OrderId, OrderStatus.Submitted);
+        FireStatusProjection(submission.Order.OrderId, OrderStatus.Submitted);
 
+        // --- Validation + correction loop ---
         while (true)
         {
-            var validation = await Workflow.ExecuteActivityAsync(
-                (OrderActivities a) => a.ValidateOrderAsync(submission),
-                ValidationActivityOptions());
+            // Trim completed projection tasks to keep the list small.
+            pendingProjections.RemoveAll(t => t.IsCompleted);
+
+            ValidationResult validation;
+            try
+            {
+                validation = await Workflow.ExecuteActivityAsync(
+                    (OrderActivities a) => a.ValidateOrderAsync(submission),
+                    ValidationActivityOptions());
+            }
+            catch (ActivityFailureException)
+            {
+                // Commerce service unavailable for the full budget window — expire gracefully.
+                return await ExpireAsync(submission.Order.OrderId,
+                    "Commerce validation service unavailable; order expired.");
+            }
 
             if (!validation.IsValid)
             {
-                await SaveStatusAsync(
-                    submission.Order.OrderId,
-                    OrderStatus.ValidationFailed,
-                    validation.Reason);
+                FireStatusProjection(submission.Order.OrderId,
+                    OrderStatus.ValidationFailed, validation.Reason);
 
                 var remaining = orderDeadline - Workflow.UtcNow;
                 if (remaining <= TimeSpan.Zero)
-                {
-                    return await ExpireAsync(submission.Order.OrderId);
-                }
+                    return await ExpireAsync(submission.Order.OrderId, "Expired waiting for support correction.");
 
                 var corrected = await Workflow.WaitConditionAsync(
                     () => state.SupportCorrection != null || state.CancellationRequested,
                     remaining);
 
                 if (!corrected)
-                {
-                    return await ExpireAsync(submission.Order.OrderId);
-                }
+                    return await ExpireAsync(submission.Order.OrderId, "Expired waiting for support correction.");
 
                 if (state.CancellationRequested)
-                {
                     return await CancelAsync(submission.Order.OrderId, "Cancelled while awaiting support correction.");
-                }
 
                 submission = submission with
                 {
@@ -65,142 +96,147 @@ public sealed class OrderProcessingWorkflow
             break;
         }
 
-        await SaveStatusAsync(submission.Order.OrderId, OrderStatus.Validated);
+        FireStatusProjection(submission.Order.OrderId, OrderStatus.Validated);
 
         state.EnrichedOrder = await Workflow.ExecuteActivityAsync(
             (OrderActivities a) => a.EnrichOrderAsync(submission),
             EnrichmentActivityOptions());
 
-        await SaveStatusAsync(submission.Order.OrderId, OrderStatus.Enriched);
-        await SaveStatusAsync(submission.Order.OrderId, OrderStatus.WaitingForPayment);
+        // Fire-and-forget projections; trim completed tasks before adding new ones.
+        pendingProjections.RemoveAll(t => t.IsCompleted);
+        FireStatusProjection(submission.Order.OrderId, OrderStatus.Enriched);
+        FireStatusProjection(submission.Order.OrderId, OrderStatus.WaitingForPayment);
 
+        // --- Payment wait loop ---
         var remainingPaymentWait = orderDeadline - Workflow.UtcNow;
         if (remainingPaymentWait <= TimeSpan.Zero)
-        {
-            return await ExpireAsync(submission.Order.OrderId);
-        }
+            return await ExpireAsync(submission.Order.OrderId, "Expired before payment wait.");
 
         var completed = await Workflow.WaitConditionAsync(
             () => state.PaymentCapture != null || state.CancellationRequested,
             remainingPaymentWait);
 
         if (!completed)
-        {
-            return await ExpireAsync(submission.Order.OrderId);
-        }
+            return await ExpireAsync(submission.Order.OrderId,
+                "Payment capture was not received within 30 days.");
 
         if (state.CancellationRequested && state.PaymentCapture == null)
-        {
             return await CancelAsync(submission.Order.OrderId, "Order cancelled before payment capture.");
-        }
 
         while (true)
         {
+            // Trim on each iteration to prevent accumulation over many invalid captures.
+            pendingProjections.RemoveAll(t => t.IsCompleted);
+
             var capturedPayment = state.PaymentCapture;
             if (capturedPayment == null)
-            {
-                return await ExpireAsync(submission.Order.OrderId);
-            }
+                return await ExpireAsync(submission.Order.OrderId,
+                    "Payment capture was not received within 30 days.");
 
-            var paymentValid = await Workflow.ExecuteActivityAsync(
-                (OrderActivities a) => a.ValidatePaymentAsync(capturedPayment),
-                PaymentActivityOptions());
+            bool paymentValid;
+            try
+            {
+                paymentValid = await Workflow.ExecuteActivityAsync(
+                    (OrderActivities a) => a.ValidatePaymentAsync(capturedPayment),
+                    PaymentActivityOptions());
+            }
+            catch (ActivityFailureException)
+            {
+                // Payment processor unreachable for > 1 min: clear capture and park back.
+                state.PaymentCapture = null;
+                FireStatusProjection(submission.Order.OrderId, OrderStatus.WaitingForPayment,
+                    "Payment validation service temporarily unavailable; awaiting a new capture.");
+                paymentValid = false;
+            }
 
             if (!paymentValid)
             {
-                state.PaymentCapture = null;
-                const string reason = "Payment capture could not be validated.";
-                await SaveStatusAsync(
-                    submission.Order.OrderId,
-                    OrderStatus.WaitingForPayment,
-                    reason);
+                if (state.PaymentCapture != null)
+                {
+                    // Explicit invalid RRN — clear and wait for a fresh capture.
+                    state.PaymentCapture = null;
+                    FireStatusProjection(submission.Order.OrderId, OrderStatus.WaitingForPayment,
+                        "Payment capture could not be validated; awaiting a new capture.");
+                }
 
                 var remainingPaymentRetry = orderDeadline - Workflow.UtcNow;
                 if (remainingPaymentRetry <= TimeSpan.Zero)
-                {
-                    return await ExpireAsync(submission.Order.OrderId);
-                }
+                    return await ExpireAsync(submission.Order.OrderId,
+                        "Payment capture was not received within 30 days.");
 
                 var retryCompleted = await Workflow.WaitConditionAsync(
                     () => state.PaymentCapture != null || state.CancellationRequested,
                     remainingPaymentRetry);
 
                 if (!retryCompleted)
-                {
-                    return await ExpireAsync(submission.Order.OrderId);
-                }
+                    return await ExpireAsync(submission.Order.OrderId,
+                        "Payment capture was not received within 30 days.");
 
                 if (state.CancellationRequested && state.PaymentCapture == null)
-                {
                     return await CancelAsync(submission.Order.OrderId, "Order cancelled before payment capture.");
-                }
 
                 continue;
             }
 
-            await SaveStatusAsync(
-                submission.Order.OrderId,
-                OrderStatus.PaymentCaptured,
-                "Payment capture validated.",
-                capturedPayment.Rrn);
+            // --- Payment is valid → fulfillment ---
+            FireStatusProjection(submission.Order.OrderId, OrderStatus.PaymentCaptured,
+                "Payment capture validated.", capturedPayment.Rrn);
 
-            var fulfillment = await Workflow.ExecuteActivityAsync(
+            var fulfillmentResult = await Workflow.ExecuteActivityAsync(
                 (OrderActivities a) => a.FulfillAsync(state.EnrichedOrder!, capturedPayment),
                 FulfillmentActivityOptions());
 
-            if (!fulfillment.Accepted)
+            if (!fulfillmentResult.Accepted)
             {
-                const string reason = "Fulfillment rejected the order.";
-                await SaveStatusAsync(
-                    submission.Order.OrderId,
-                    OrderStatus.FulfillmentFailed,
-                    reason,
-                    capturedPayment.Rrn);
-                return new OrderStatusView(
-                    submission.Order.OrderId,
-                    OrderStatus.FulfillmentFailed,
-                    reason,
-                    capturedPayment.Rrn);
+                return await SetTerminalAsync(submission.Order.OrderId,
+                    OrderStatus.FulfillmentFailed, "Fulfillment rejected the order.", capturedPayment.Rrn);
             }
 
+            // Persist full enriched record; treat failure as eventual projection lag.
             try
             {
                 await Workflow.ExecuteActivityAsync(
                     (OrderActivities a) => a.SaveFulfilledAsync(state.EnrichedOrder!, capturedPayment),
                     FulfilledDashboardActivityOptions());
             }
-            catch
+            catch (ActivityFailureException)
             {
-                state.Status = OrderStatus.Fulfilled;
-                state.Message = "Order forwarded to fulfillment. Dashboard projection sync failed after fulfillment acceptance.";
-                return new OrderStatusView(
-                    submission.Order.OrderId,
-                    OrderStatus.Fulfilled,
-                    state.Message,
-                    capturedPayment.Rrn);
+                // Dashboard write failed after fulfillment accepted — do NOT compensate.
+                // Operator can reconcile from the Temporal UI history.
             }
 
-            state.Status = OrderStatus.Fulfilled;
-            state.Message = "Order forwarded to fulfillment.";
-
-            return new OrderStatusView(submission.Order.OrderId, state.Status, state.Message, capturedPayment.Rrn);
+            return await SetTerminalAsync(submission.Order.OrderId,
+                OrderStatus.Fulfilled, "Order forwarded to fulfillment.", capturedPayment.Rrn);
         }
+    }
 
+    // ---------------------------------------------------------------------------
+    // Signal handlers — kept as a documented fallback for integrations that
+    // cannot use Updates (fire-and-forget webhooks, etc.).
+    // The Update variants provide synchronous accept/reject feedback via HTTP 409.
+    // ---------------------------------------------------------------------------
+
+    /// <summary>
+    /// Delivers a pending order submission when the workflow was started by the payment
+    /// controller before the Commerce webhook arrived (payment-before-order path).
+    /// </summary>
+    [WorkflowSignal]
+    public Task ReceiveOrderSubmissionAsync(OrderSubmission submission)
+    {
+        if (state.PendingSubmission == null && !IsTerminal(state.Status))
+            state.PendingSubmission = submission;
+        return Task.CompletedTask;
     }
 
     [WorkflowSignal]
     public Task CapturePaymentAsync(PaymentCapture capture)
     {
         if (!string.Equals(capture.CustomerId, state.CustomerId, StringComparison.Ordinal))
-        {
             return Task.CompletedTask;
-        }
+        if (state.CancellationRequested || state.PaymentCapture != null || IsTerminal(state.Status))
+            return Task.CompletedTask;
 
-        if (state.PaymentCapture == null && !IsTerminal(state.Status))
-        {
-            state.PaymentCapture = capture;
-        }
-
+        state.PaymentCapture = capture;
         return Task.CompletedTask;
     }
 
@@ -214,28 +250,31 @@ public sealed class OrderProcessingWorkflow
     public void ValidateCapturePaymentUpdate(PaymentCapture capture)
     {
         if (!string.Equals(capture.CustomerId, state.CustomerId, StringComparison.Ordinal))
-        {
-            throw new InvalidOperationException("Payment customer does not match the order customer.");
-        }
+            throw new ApplicationFailureException(
+                "Payment customer does not match the order customer.",
+                errorType: "CustomerMismatch", nonRetryable: true);
+
+        if (state.CancellationRequested)
+            throw new ApplicationFailureException(
+                "Order has already been cancelled.",
+                errorType: "OrderCancelled", nonRetryable: true);
 
         if (state.PaymentCapture != null)
-        {
-            throw new InvalidOperationException("Payment has already been captured for this order.");
-        }
+            throw new ApplicationFailureException(
+                "Payment has already been captured for this order.",
+                errorType: "PaymentAlreadyCaptured", nonRetryable: true);
 
-        if (state.Status == OrderStatus.Cancelled || state.Status == OrderStatus.Expired || state.Status == OrderStatus.Fulfilled)
-        {
-            throw new InvalidOperationException("Payment update is not allowed in the current order state.");
-        }
+        if (IsTerminal(state.Status))
+            throw new ApplicationFailureException(
+                $"Payment update is not allowed in state '{state.Status}'.",
+                errorType: "WrongPhase", nonRetryable: true);
     }
 
     [WorkflowSignal]
-    public Task CancelAsync(string reason)
+    public Task CancelOrderSignalAsync(string reason)
     {
-        if (IsTerminal(state.Status) || state.PaymentCapture != null)
-        {
+        if (IsTerminal(state.Status) || state.PaymentCapture != null || state.CancellationRequested)
             return Task.CompletedTask;
-        }
 
         state.CancellationRequested = true;
         state.Message = reason;
@@ -245,25 +284,28 @@ public sealed class OrderProcessingWorkflow
     [WorkflowUpdate]
     public Task CancelOrderUpdateAsync(string reason)
     {
-        return CancelAsync(reason);
+        return CancelOrderSignalAsync(reason);
     }
 
     [WorkflowUpdateValidator(nameof(CancelOrderUpdateAsync))]
     public void ValidateCancelOrderUpdate(string reason)
     {
         if (state.PaymentCapture != null)
-        {
-            throw new InvalidOperationException("Order cannot be cancelled after payment has been captured.");
-        }
+            throw new ApplicationFailureException(
+                "Order cannot be cancelled after payment has been captured.",
+                errorType: "PaymentAlreadyCaptured", nonRetryable: true);
+
+        if (IsTerminal(state.Status))
+            throw new ApplicationFailureException(
+                $"Order cannot be cancelled in state '{state.Status}'.",
+                errorType: "WrongPhase", nonRetryable: true);
     }
 
     [WorkflowSignal]
     public Task CorrectOrderAsync(SupportCorrection correction)
     {
-        if (!IsTerminal(state.Status) && state.Status == OrderStatus.ValidationFailed)
-        {
+        if (state.Status == OrderStatus.ValidationFailed)
             state.SupportCorrection = correction;
-        }
         return Task.CompletedTask;
     }
 
@@ -277,58 +319,75 @@ public sealed class OrderProcessingWorkflow
     public void ValidateCorrectOrderUpdate(SupportCorrection correction)
     {
         if (state.Status != OrderStatus.ValidationFailed)
-        {
-            throw new InvalidOperationException("Support corrections are only allowed while the order is awaiting validation correction.");
-        }
+            throw new ApplicationFailureException(
+                $"Support corrections are only allowed in ValidationFailed state (current: '{state.Status}').",
+                errorType: "WrongPhase", nonRetryable: true);
     }
 
     [WorkflowQuery]
-    public OrderStatusView GetStatus()
+    public OrderStatusView GetStatus() =>
+        new(Workflow.Info.WorkflowId, state.Status, state.Message, state.PaymentCapture?.Rrn);
+
+    // ---------------------------------------------------------------------------
+    // Private helpers
+    // ---------------------------------------------------------------------------
+
+    private async Task<OrderStatusView> SetTerminalAsync(
+        string orderId,
+        OrderStatus status,
+        string message,
+        string? rrn = null)
     {
-        return new OrderStatusView(
-            Workflow.Info.WorkflowId,
-            state.Status,
-            state.Message,
-            state.PaymentCapture?.Rrn);
+        state.Status = status;
+        state.Message = message;
+        SetSearchAttribute(status);
+
+        // Flush all pending projection tasks so the dashboard is up to date at close.
+        await Workflow.WhenAllAsync(pendingProjections);
+        pendingProjections.Clear();
+
+        await Workflow.WaitConditionAsync(() => Workflow.AllHandlersFinished);
+        return new OrderStatusView(orderId, status, message, rrn);
     }
 
     private async Task<OrderStatusView> CancelAsync(string orderId, string reason)
     {
-        state.Status = OrderStatus.Cancelled;
-        state.Message = reason;
-        await SaveStatusAsync(orderId, state.Status, reason);
-        return new OrderStatusView(orderId, state.Status, reason, state.PaymentCapture?.Rrn);
+        FireStatusProjection(orderId, OrderStatus.Cancelled, reason);
+        return await SetTerminalAsync(orderId, OrderStatus.Cancelled, reason);
     }
 
-    private async Task<OrderStatusView> ExpireAsync(string orderId)
+    private async Task<OrderStatusView> ExpireAsync(string orderId, string reason)
     {
-        state.Status = OrderStatus.Expired;
-        state.Message = "Payment capture was not received within 30 days.";
-        await SaveStatusAsync(orderId, state.Status, state.Message);
-        return new OrderStatusView(orderId, state.Status, state.Message);
+        FireStatusProjection(orderId, OrderStatus.Expired, reason);
+        return await SetTerminalAsync(orderId, OrderStatus.Expired, reason);
     }
 
-    private async Task SaveStatusAsync(
+    private void FireStatusProjection(
         string orderId,
         OrderStatus newStatus,
-        string? newMessage = null,
+        string? message = null,
         string? rrn = null)
     {
         state.Status = newStatus;
-        state.Message = newMessage;
-        Workflow.UpsertTypedSearchAttributes(new[]
-        {
-            SearchAttributeUpdate.ValueSet(OrderStatusKey, newStatus.ToString())
-        });
-
-        await Workflow.ExecuteActivityAsync(
-            (OrderActivities a) => a.SaveStatusAsync(
-                new OrderStatusView(orderId, newStatus, newMessage, rrn)),
-            StatusActivityOptions());
+        state.Message = message;
+        SetSearchAttribute(newStatus);
+        var view = new OrderStatusView(orderId, newStatus, message, rrn);
+        pendingProjections.Add(
+            Workflow.ExecuteActivityAsync(
+                (OrderActivities a) => a.SaveStatusAsync(view),
+                StatusActivityOptions()));
     }
 
-    // Commerce validation: short per-attempt budget, 2-min total window matches the 150 RPS
-    // Commerce rate-limit queue; a longer window would accumulate backpressure behind the queue.
+    private void SetSearchAttribute(OrderStatus status)
+    {
+        Workflow.UpsertTypedSearchAttributes(
+            SearchAttributeUpdate.ValueSet(OrderStatusKey, status.ToString()));
+    }
+
+    // ---------------------------------------------------------------------------
+    // Activity options
+    // ---------------------------------------------------------------------------
+
     private static ActivityOptions ValidationActivityOptions() => new()
     {
         TaskQueue = TemporalConstants.CommerceTaskQueue,
@@ -336,8 +395,6 @@ public sealed class OrderProcessingWorkflow
         ScheduleToCloseTimeout = TimeSpan.FromMinutes(2)
     };
 
-    // PIM enrichment: service deploys may take minutes; allow hours so a brief outage
-    // does not permanently fail a 30-day order. MaximumInterval caps exponential back-off.
     private static ActivityOptions EnrichmentActivityOptions() => new()
     {
         StartToCloseTimeout = TimeSpan.FromSeconds(30),
@@ -345,25 +402,18 @@ public sealed class OrderProcessingWorkflow
         RetryPolicy = new RetryPolicy { MaximumInterval = TimeSpan.FromMinutes(5) }
     };
 
-    // Dashboard status writes are projection updates; they must eventually succeed
-    // but should never fail the order. No ScheduleToCloseTimeout — retry indefinitely
-    // up to the workflow lifetime, with back-off capped at 5 min.
     private static ActivityOptions StatusActivityOptions() => new()
     {
         StartToCloseTimeout = TimeSpan.FromSeconds(15),
         RetryPolicy = new RetryPolicy { MaximumInterval = TimeSpan.FromMinutes(5) }
     };
 
-    // Payment validation: a 1-min total budget lets a brief processor blip retry
-    // while still responding to the payment webhook within a reasonable SLA.
     private static ActivityOptions PaymentActivityOptions() => new()
     {
         StartToCloseTimeout = TimeSpan.FromSeconds(10),
         ScheduleToCloseTimeout = TimeSpan.FromMinutes(1)
     };
 
-    // Fulfillment submission: idempotent by order ID, but downstream may queue.
-    // Hours window tolerable because fulfillment acceptance is the final step.
     private static ActivityOptions FulfillmentActivityOptions() => new()
     {
         StartToCloseTimeout = TimeSpan.FromSeconds(30),
@@ -371,26 +421,17 @@ public sealed class OrderProcessingWorkflow
         RetryPolicy = new RetryPolicy { MaximumInterval = TimeSpan.FromMinutes(5) }
     };
 
-    // Dashboard fulfilled write: same eventually-consistent projection policy as status writes.
     private static ActivityOptions FulfilledDashboardActivityOptions() => new()
     {
         StartToCloseTimeout = TimeSpan.FromSeconds(15),
         RetryPolicy = new RetryPolicy { MaximumInterval = TimeSpan.FromMinutes(5) }
     };
 
-    private static ActivityOptions CompensationActivityOptions() => new()
-    {
-        StartToCloseTimeout = TimeSpan.FromSeconds(15),
-        ScheduleToCloseTimeout = TimeSpan.FromMinutes(2)
-    };
-
-    private static bool IsTerminal(OrderStatus orderStatus) =>
-        orderStatus is OrderStatus.PaymentCaptured
-            or OrderStatus.Cancelled
+    private static bool IsTerminal(OrderStatus status) =>
+        status is OrderStatus.Cancelled
             or OrderStatus.Expired
             or OrderStatus.FulfillmentFailed
-            or OrderStatus.Fulfilled
-            or OrderStatus.PaymentRejected;
+            or OrderStatus.Fulfilled;
 
     private sealed class WorkflowState
     {
@@ -398,6 +439,7 @@ public sealed class OrderProcessingWorkflow
         public OrderStatus Status { get; set; } = OrderStatus.Submitted;
         public string? Message { get; set; }
         public PaymentCapture? PaymentCapture { get; set; }
+        public OrderSubmission? PendingSubmission { get; set; }
         public SupportCorrection? SupportCorrection { get; set; }
         public bool CancellationRequested { get; set; }
         public EnrichedOrder? EnrichedOrder { get; set; }

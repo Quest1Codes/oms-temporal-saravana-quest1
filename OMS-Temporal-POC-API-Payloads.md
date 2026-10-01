@@ -1,5 +1,7 @@
 # OMS Temporal POC - API Payloads
 
+All request bodies use **snake_case** field names matching the spec DTOs.
+
 ## Base URL
 
 ```text
@@ -30,21 +32,15 @@ Content-Type: application/json
 
 ```json
 {
-  "customerId": "CUST-001",
+  "customer_id": "CUST-001",
   "order": {
-    "orderId": "ORD-1001",
+    "order_id": "ORD-1001",
     "items": [
       {
-        "itemId": "ITEM-001",
-        "quantity": 2,
-        "skuId": "SKU-001",
-        "brandCode": "BRAND-001"
+        "item_id": "ITEM-001",
+        "quantity": 2
       }
     ]
-  },
-  "riskData": {
-    "riskInput": "STANDARD",
-    "riskDecision": "APPROVED"
   }
 }
 ```
@@ -71,7 +67,7 @@ Example response:
 
 ```json
 {
-  "orderId": "ORD-1001",
+  "order_id": "ORD-1001",
   "status": "WaitingForPayment"
 }
 ```
@@ -79,7 +75,7 @@ Example response:
 Possible statuses:
 
 ```text
-Received
+Submitted
 ValidationFailed
 Validated
 Enriched
@@ -87,6 +83,7 @@ WaitingForPayment
 PaymentCaptured
 Cancelled
 Expired
+FulfillmentFailed
 Fulfilled
 ```
 
@@ -101,29 +98,46 @@ POST /api/orders/ORD-1001/payment
 Content-Type: application/json
 ```
 
+Payload matches the spec's Payment Processor Service shape:
+
 ```json
 {
+  "customer_id": "CUST-001",
   "rrn": "RRN-100001",
-  "amount": 150.00
+  "amount_cents": 12999,
+  "metadata": {
+    "order_id": "ORD-1001"
+  }
 }
 ```
+
+`metadata.order_id` must match the route `{orderId}`.
 
 Expected response:
 
 ```json
 {
-  "message": "Payment signal sent",
-  "orderId": "ORD-1001"
+  "orderId": "ORD-1001",
+  "message": "Payment signal sent"
 }
 ```
 
-The workflow receives the payment through a Temporal Signal and validates the RRN through the payment integration/activity.
+If payment arrives before the order exists, the response is:
+
+```json
+{
+  "orderId": "ORD-1001",
+  "message": "Payment buffered; awaiting order submission."
+}
+```
+
+The workflow starts in a waiting state; the payment is delivered once the Commerce webhook arrives.
 
 ---
 
 # 4. Cancel Order
 
-Cancellation is allowed before payment capture.
+Cancellation is allowed before payment capture. Returns HTTP 409 if payment has already been captured or the order is terminal.
 
 ```http
 POST /api/orders/ORD-1001/cancel
@@ -140,8 +154,8 @@ Expected response:
 
 ```json
 {
-  "message": "Cancellation signal sent",
-  "orderId": "ORD-1001"
+  "orderId": "ORD-1001",
+  "message": "Cancellation signal sent"
 }
 ```
 
@@ -149,7 +163,7 @@ Expected response:
 
 # 5. Support Correction
 
-Use this when Commerce validation fails.
+Use this when Commerce validation fails (status `ValidationFailed`). Returns HTTP 409 if the order is not in `ValidationFailed` state.
 
 ```http
 POST /api/orders/ORD-1002/support-correction
@@ -160,15 +174,10 @@ Content-Type: application/json
 {
   "items": [
     {
-      "itemId": "ITEM-001",
+      "item_id": "ITEM-001",
       "quantity": 2
-    },
-    {
-      "itemId": "ITEM-002",
-      "quantity": 1
     }
-  ],
-  "reason": "Corrected invalid item quantity"
+  ]
 }
 ```
 
@@ -176,8 +185,8 @@ Expected response:
 
 ```json
 {
-  "message": "Support correction signal sent",
-  "orderId": "ORD-1002"
+  "orderId": "ORD-1002",
+  "message": "Support correction signal sent"
 }
 ```
 
@@ -191,7 +200,7 @@ The workflow receives the correction and re-runs validation.
 GET /health
 ```
 
-Example response:
+Example response (Temporal reachable):
 
 ```json
 {
@@ -200,13 +209,23 @@ Example response:
 }
 ```
 
+Example response (Temporal unreachable — HTTP 503):
+
+```json
+{
+  "status": "degraded",
+  "temporal": "localhost:7233",
+  "error": "connection refused"
+}
+```
+
 ---
 
 # End-to-End Scenarios
 
-## Scenario 1 - Normal Order
+## Scenario 1 — Normal Order
 
-### Step 1 - Submit
+### Step 1 — Submit
 
 ```http
 POST /api/orders
@@ -215,30 +234,25 @@ Content-Type: application/json
 
 ```json
 {
-  "orderId": "ORD-1001",
-  "customerId": "CUST-001",
-  "items": [
-    {
-      "itemId": "ITEM-001",
-      "quantity": 2
-    }
-  ]
+  "customer_id": "CUST-001",
+  "order": {
+    "order_id": "ORD-1001",
+    "items": [
+      { "item_id": "ITEM-001", "quantity": 2 }
+    ]
+  }
 }
 ```
 
-### Step 2 - Check status
+### Step 2 — Check status
 
 ```http
 GET /api/orders/ORD-1001
 ```
 
-Expected:
+Expected: `"status": "WaitingForPayment"`
 
-```text
-WaitingForPayment
-```
-
-### Step 3 - Capture payment
+### Step 3 — Capture payment
 
 ```http
 POST /api/orders/ORD-1001/payment
@@ -247,53 +261,34 @@ Content-Type: application/json
 
 ```json
 {
+  "customer_id": "CUST-001",
   "rrn": "RRN-100001",
-  "amount": 150.00
+  "amount_cents": 12999,
+  "metadata": { "order_id": "ORD-1001" }
 }
 ```
 
-### Step 4 - Check status
+### Step 4 — Check status
 
 ```http
 GET /api/orders/ORD-1001
 ```
 
-Expected final status:
+Expected final status: `"status": "Fulfilled"`
+
+### Workflow path
 
 ```text
-Fulfilled
-```
-
-### Workflow
-
-```text
-Order Submitted
-      |
-      v
-Commerce Validation
-      |
-      v
-PIM Enrichment
-      |
-      v
-WaitingForPayment
-      |
-      | Payment Signal
-      v
-Payment Validation
-      |
-      v
-Fulfillment
-      |
-      v
-Fulfilled
+Submitted → Commerce Validation → PIM Enrichment
+  → WaitingForPayment → [Payment Signal]
+  → Payment Validation → Fulfillment → Fulfilled
 ```
 
 ---
 
-# Scenario 2 - Invalid Order and Support Correction
+## Scenario 2 — Invalid Order and Support Correction
 
-### Step 1 - Submit invalid order
+### Step 1 — Submit invalid order
 
 ```http
 POST /api/orders
@@ -302,24 +297,19 @@ Content-Type: application/json
 
 ```json
 {
-  "orderId": "ORD-1002",
-  "customerId": "CUST-001",
-  "items": [
-    {
-      "itemId": "INVALID-ITEM",
-      "quantity": 0
-    }
-  ]
+  "customer_id": "CUST-001",
+  "order": {
+    "order_id": "ORD-1002",
+    "items": [
+      { "item_id": "INVALID-ITEM", "quantity": 0 }
+    ]
+  }
 }
 ```
 
-Expected status:
+Expected status: `"status": "ValidationFailed"`
 
-```text
-ValidationFailed
-```
-
-### Step 2 - Correct the order
+### Step 2 — Correct the order
 
 ```http
 POST /api/orders/ORD-1002/support-correction
@@ -329,57 +319,18 @@ Content-Type: application/json
 ```json
 {
   "items": [
-    {
-      "itemId": "ITEM-001",
-      "quantity": 1
-    }
-  ],
-  "reason": "Corrected invalid item"
-}
-```
-
-### Expected progression
-
-```text
-ValidationFailed
-      |
-      | Support Correction Signal
-      v
-Validation
-      |
-      v
-PIM Enrichment
-      |
-      v
-WaitingForPayment
-```
-
----
-
-# Scenario 3 - Cancellation Before Payment
-
-### Submit order
-
-```json
-{
-  "orderId": "ORD-1003",
-  "customerId": "CUST-002",
-  "items": [
-    {
-      "itemId": "ITEM-001",
-      "quantity": 1
-    }
+    { "item_id": "ITEM-001", "quantity": 1 }
   ]
 }
 ```
 
-Wait until:
+Expected progression: `ValidationFailed → Validated → Enriched → WaitingForPayment`
 
-```text
-WaitingForPayment
-```
+---
 
-Then:
+## Scenario 3 — Cancellation Before Payment
+
+Submit an order and wait until `WaitingForPayment`, then:
 
 ```http
 POST /api/orders/ORD-1003/cancel
@@ -387,230 +338,67 @@ Content-Type: application/json
 ```
 
 ```json
-{
-  "reason": "Customer cancelled order"
-}
+{ "reason": "Customer cancelled order" }
 ```
 
-Expected:
-
-```text
-Cancelled
-```
+Expected: `"status": "Cancelled"`
 
 ---
 
-# Scenario 4 - Payment Never Received
+## Scenario 4 — Payment Never Received (Expires)
 
-Submit:
+Submit an order and do not send payment. After 30 days the workflow expires:
 
-```http
-POST /api/orders
-Content-Type: application/json
-```
+Expected: `"status": "Expired"`
 
-```json
-{
-  "orderId": "ORD-1004",
-  "customerId": "CUST-003",
-  "items": [
-    {
-      "itemId": "ITEM-001",
-      "quantity": 1
-    }
-  ]
-}
-```
-
-Do not send payment.
-
-The workflow waits for payment capture for up to:
-
-```text
-30 days
-```
-
-After the timeout:
-
-```text
-Expired
-```
-
-The expired order is written to dashboard storage.
-
-For automated tests, Temporal time-skipping can be used so the 30-day timer does not require waiting 30 real days.
+For automated tests, Temporal time-skipping advances the virtual clock instantly.
 
 ---
 
-# Scenario 5 - Invalid Payment
+## Scenario 5 — Invalid Payment RRN
 
-Submit an order and wait for:
-
-```text
-WaitingForPayment
-```
-
-Then:
-
-```http
-POST /api/orders/ORD-1005/payment
-Content-Type: application/json
-```
+Send a payment with an RRN that does not start with `RRN-`:
 
 ```json
 {
-  "rrn": "INVALID-RRN",
-  "amount": 150.00
+  "customer_id": "CUST-001",
+  "rrn": "BADRRN-001",
+  "amount_cents": 12999,
+  "metadata": { "order_id": "ORD-1005" }
 }
 ```
 
-The mock payment processor rejects an invalid RRN.
-
-A valid example is:
-
-```text
-RRN-123456
-```
+The workflow rejects the RRN, clears the capture, and returns to `WaitingForPayment` with message `"Payment capture could not be validated; awaiting a new capture."` A subsequent valid capture proceeds normally.
 
 ---
 
-# Scenario 6 - Multiple Items and PIM Enrichment
+## Scenario 6 — Payment Arrives Before Order
+
+Send payment before submitting the order:
 
 ```http
-POST /api/orders
+POST /api/orders/ORD-1006/payment
 Content-Type: application/json
 ```
 
 ```json
 {
-  "orderId": "ORD-1006",
-  "customerId": "CUST-005",
-  "items": [
-    {
-      "itemId": "ITEM-001",
-      "quantity": 2
-    },
-    {
-      "itemId": "ITEM-002",
-      "quantity": 3
-    },
-    {
-      "itemId": "ITEM-003",
-      "quantity": 1
-    }
-  ]
+  "customer_id": "CUST-001",
+  "rrn": "RRN-100006",
+  "amount_cents": 12999,
+  "metadata": { "order_id": "ORD-1006" }
 }
 ```
 
-PIM enrichment adds SKU ID and Brand Code.
+Response: `"message": "Payment buffered; awaiting order submission."`
 
-Example:
-
-```json
-{
-  "itemId": "ITEM-001",
-  "quantity": 2,
-  "skuId": "SKU-ITEM-001",
-  "brandCode": "BRAND-001"
-}
-```
-
----
-
-# Scenario 7 - Payment Arrives Later
-
-### Submit order
-
-```json
-{
-  "orderId": "ORD-1007",
-  "customerId": "CUST-006",
-  "items": [
-    {
-      "itemId": "ITEM-001",
-      "quantity": 1
-    }
-  ]
-}
-```
-
-The workflow waits:
-
-```text
-WaitingForPayment
-```
-
-Later send:
-
-```http
-POST /api/orders/ORD-1007/payment
-Content-Type: application/json
-```
-
-```json
-{
-  "rrn": "RRN-100007",
-  "amount": 250.00
-}
-```
-
-The payment Signal wakes the waiting workflow.
-
----
-
-# Scenario 8 - Payment and Cancellation Race
-
-Submit:
-
-```json
-{
-  "orderId": "ORD-1008",
-  "customerId": "CUST-007",
-  "items": [
-    {
-      "itemId": "ITEM-001",
-      "quantity": 1
-    }
-  ]
-}
-```
-
-Then test either event:
-
-### Cancellation
-
-```http
-POST /api/orders/ORD-1008/cancel
-Content-Type: application/json
-```
-
-```json
-{
-  "reason": "Customer requested cancellation"
-}
-```
-
-### Or payment
-
-```http
-POST /api/orders/ORD-1008/payment
-Content-Type: application/json
-```
-
-```json
-{
-  "rrn": "RRN-100008",
-  "amount": 100.00
-}
-```
-
-This scenario tests asynchronous event handling.
+Then submit the order normally. The workflow unparks, processes the buffered payment, and proceeds to `Fulfilled`.
 
 ---
 
 # Fulfillment Output
 
-After successful payment validation, the fulfillment integration receives:
+After successful payment validation, the fulfillment integration receives a message matching the spec contract:
 
 ```json
 {
@@ -630,55 +418,32 @@ After successful payment validation, the fulfillment integration receives:
 }
 ```
 
-Kafka is intentionally not used in this POC. Fulfillment is represented by a Temporal Activity/integration boundary.
+Kafka is intentionally not used in this POC. Fulfillment is represented by a Temporal Activity / integration boundary.
 
 ---
 
 # Temporal Web UI
 
-Start Temporal:
-
 ```powershell
-temporal server start-dev
+.\temporal-start.ps1
 ```
 
-Temporal frontend:
+Temporal frontend: `localhost:7233`  
+Temporal Web UI: `http://localhost:8233`
 
-```text
-localhost:7233
-```
-
-Temporal Web UI:
-
-```text
-http://localhost:8233
-```
-
-After creating an order, look for the workflow using the order ID:
-
-```text
-ORD-1001
-```
-
-The workflow history should show activities, signals, timers, and workflow state transitions.
+After creating an order, search for the workflow using the order ID (e.g. `ORD-1001`). The history shows activities, signals, timers, and state transitions. The `OrderStatus` keyword search attribute is upserted on every transition so you can filter: `OrderStatus = 'WaitingForPayment'`.
 
 ---
 
 # Swagger UI
 
-If Swagger is enabled:
-
 ```text
 http://localhost:5000/swagger
 ```
 
-Replace `5000` with the API port displayed by:
+Replace `5000` with the port displayed by the OMS API.
 
-```text
-Now listening on: http://localhost:XXXX
-```
-
-Recommended happy-path testing order:
+Happy-path sequence:
 
 ```text
 1. POST /api/orders
@@ -687,166 +452,33 @@ Recommended happy-path testing order:
 4. GET  /api/orders/{orderId}
 ```
 
-Invalid-order testing:
+Invalid-order sequence:
 
 ```text
-1. POST /api/orders
+1. POST /api/orders          (item_id contains "INVALID")
 2. GET  /api/orders/{orderId}
 3. POST /api/orders/{orderId}/support-correction
 4. GET  /api/orders/{orderId}
+5. POST /api/orders/{orderId}/payment
+6. GET  /api/orders/{orderId}
 ```
-
-Cancellation testing:
-
-```text
-1. POST /api/orders
-2. GET  /api/orders/{orderId}
-3. POST /api/orders/{orderId}/cancel
-4. GET  /api/orders/{orderId}
-```
-
----
-
-# POC Architecture
-
-```text
-                    +----------------------+
-                    |      Swagger UI      |
-                    |      /swagger       |
-                    +----------+-----------+
-                               |
-                               v
-                    +----------------------+
-                    |       OMS API        |
-                    |    ASP.NET Core      |
-                    +----------+-----------+
-                               |
-                         Temporal SDK
-                               |
-                               v
-              +--------------------------------+
-              |       Temporal Server          |
-              |       localhost:7233           |
-              |                                |
-              |       Temporal Web UI           |
-              |       localhost:8233            |
-              +----------------+---------------+
-                               |
-                               v
-                    +----------------------+
-                    |   Temporal Worker    |
-                    | Order Processing WF   |
-                    +----------+-----------+
-                               |
-             +-----------------+-----------------+
-             |                 |                 |
-             v                 v                 v
-      +------------+    +------------+    +------------+
-      |  Commerce  |    |    PIM     |    |  Payment   |
-      |    Mock    |    |    Mock    |    |    Mock    |
-      +------------+    +------------+    +------------+
-                               |
-                               v
-                       +---------------+
-                       |  Fulfillment  |
-                       |      Mock     |
-                       +---------------+
-```
-
----
-
-# Temporal Features Demonstrated
-
-| Requirement | Temporal Feature |
-|---|---|
-| Long-running order process | Workflow |
-| Commerce validation | Activity |
-| PIM enrichment | Activity |
-| Payment arriving later | Signal |
-| Support correction | Signal |
-| Cancellation | Signal |
-| 30-day waiting period | Timer |
-| Order expiration | Timer + Workflow state |
-| Order status | Query |
-| Integration failure handling | Activity Retry Policy |
-| Fulfillment integration | Activity |
-| Workflow history | Temporal |
-| Workflow monitoring | Temporal Web UI |
-
----
-
-# PII Considerations
-
-Customer email information is future PII data.
-
-For a production implementation:
-
-- Do not log customer email addresses.
-- Avoid unnecessary PII in Temporal workflow history.
-- Store sensitive customer information in an appropriate protected data store.
-- Pass only the minimum required information to Activities.
-- Apply encryption and access controls.
-- Avoid exposing PII through API responses unless required.
-
----
-
-# Local Persistence
-
-This POC intentionally uses in-memory storage.
-
-Temporal local development server:
-
-```text
-In-memory persistence
-```
-
-Application order/dashboard repository:
-
-```text
-In-memory repository
-```
-
-Therefore, restarting the local Temporal server or application can remove local state.
-
-This setup is intended for development, demonstration, and assessment purposes rather than production durability.
 
 ---
 
 # Start the POC
 
-## Terminal 1 - Temporal
+## Terminal 1 — Temporal
 
 ```powershell
-temporal server start-dev
+.\temporal-start.ps1
 ```
 
-Keep this terminal running.
+Registers `OrderStatus=Keyword` and starts the dev server.
 
-## Terminal 2 - OMS API
+## Terminal 2 — OMS API + worker promotion
 
 ```powershell
-cd C:\Quest1\OMS-Temporal-POC
-dotnet run --project src\OMS.Api
+.\run.ps1
 ```
 
-## Browser
-
-Swagger:
-
-```text
-http://localhost:5000/swagger
-```
-
-Temporal UI:
-
-```text
-http://localhost:8233
-```
-
-Health:
-
-```text
-http://localhost:5000/health
-```
-
-Replace `5000` with the port displayed by the OMS API.
+Restores, starts the API, waits for the worker to poll, then promotes the deployment version.
